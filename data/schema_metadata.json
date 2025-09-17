@@ -1,0 +1,117 @@
+{
+  "crm_people": {
+    "description": "Люди в CRM (клиенты и сотрудники) с контактными данными.",
+    "columns": {
+      "id": "Уникальный идентификатор человека",
+      "first_name": "Имя",
+      "last_name": "Фамилия",
+      "middle_name": "Отчество (если есть)",
+      "phone_number": "Контактный телефон",
+      "email": "Электронная почта",
+      "birth_date": "Дата рождения",
+      "gender": "Пол",
+      "created_at": "Дата и время создания записи"
+    }
+  },
+  "crm_clients": {
+    "description": "Профиль клиента и его лояльность.",
+    "columns": {
+      "id": "Идентификатор профиля клиента",
+      "person_id": "Связь с crm_people",
+      "loyalty_level": "Уровень лояльности (platinum, gold и т.п.)",
+      "referred_by": "Источник привлечения",
+      "created_at": "Когда клиент добавлен",
+      "notes": "Дополнительные заметки"
+    }
+  },
+  "crm_employees": {
+    "description": "Профили сотрудников и их должности.",
+    "columns": {
+      "id": "Идентификатор сотрудника",
+      "person_id": "Связь с crm_people",
+      "position": "Должность или роль",
+      "hire_date": "Дата найма",
+      "fire_date": "Дата увольнения (если есть)",
+      "is_active": "Активен ли сотрудник"
+    }
+  },
+  "crm_service_categories": {
+    "description": "Категории услуг салона.",
+    "columns": {
+      "id": "Идентификатор категории",
+      "name": "Название категории",
+      "description": "Описание категории"
+    }
+  },
+  "crm_services": {
+    "description": "Каталог услуг, с ценой и длительностью.",
+    "columns": {
+      "id": "Идентификатор услуги",
+      "category_id": "Ссылка на категорию",
+      "name": "Название услуги",
+      "base_price": "Базовая цена услуги",
+      "duration_minutes": "Базовая длительность в минутах",
+      "description": "Описание услуги"
+    }
+  },
+  "crm_employee_services": {
+    "description": "Какие сотрудники оказывают какие услуги.",
+    "columns": {
+      "employee_id": "Сотрудник",
+      "service_id": "Услуга",
+      "expertise_level": "Уровень компетенции"
+    }
+  },
+  "crm_appointments": {
+    "description": "Записи клиентов с основной информацией.",
+    "columns": {
+      "id": "Идентификатор записи",
+      "client_id": "Ссылка на crm_clients",
+      "primary_employee_id": "Основной сотрудник",
+      "scheduled_start": "Начало визита",
+      "scheduled_end": "Окончание визита",
+      "status": "Статус записи",
+      "total_price": "Сумма услуг в визите",
+      "paid_amount": "Сколько оплачено",
+      "payment_status": "Статус оплаты",
+      "notes": "Заметки менеджера",
+      "created_at": "Когда запись создана",
+      "updated_at": "Когда запись изменена",
+      "cancelled_at": "Когда отменили (если отмена)"
+    }
+  },
+  "crm_appointment_services": {
+    "description": "Услуги в рамках конкретной записи.",
+    "columns": {
+      "id": "Идентификатор строки услуги",
+      "appointment_id": "Связь с crm_appointments",
+      "service_id": "Услуга из каталога",
+      "employee_id": "Исполнитель услуги",
+      "price": "Индивидуальная цена",
+      "duration_minutes": "Фактическая длительность",
+      "comment": "Комментарий к услуге"
+    }
+  },
+  "crm_payments": {
+    "description": "Платежи по визитам.",
+    "columns": {
+      "id": "Идентификатор платежа",
+      "appointment_id": "Запись, к которой относится платеж",
+      "amount": "Сумма платежа",
+      "paid_at": "Дата и время платежа",
+      "method": "Способ оплаты",
+      "reference": "Номер платежного документа"
+    }
+  },
+  "crm_client_interactions": {
+    "description": "История коммуникаций с клиентами.",
+    "columns": {
+      "id": "Идентификатор взаимодействия",
+      "client_id": "Клиент",
+      "interaction_type": "Тип взаимодействия (call, reminder и т.д.)",
+      "performed_by": "Сотрудник, кто общался",
+      "occurred_at": "Когда произошло",
+      "notes": "Заметки по взаимодействию"
+    }
+  }
+}
