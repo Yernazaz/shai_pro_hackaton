@@ -2,7 +2,7 @@ import json
 import os
 from typing import Any, List
 
-from app.utils.openai_config import get_openai_model
+from app.utils.gemini_config import get_gemini_model
 from app.utils.llm_client import chat_completion
 
 
@@ -65,7 +65,7 @@ def generate_summary_from_result(intent: str, result: list, original_query: str 
 
     try:
         response = chat_completion(
-            model=get_openai_model(),
+            model=get_gemini_model(),
             messages=messages,
             temperature=0.4,
         )

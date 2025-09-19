@@ -1,13 +1,15 @@
 import asyncio
+import html
+import io
 import json
 import logging
 import os
-import time
 from typing import Any, Dict
 
+import httpx
 from dotenv import load_dotenv
 from app.utils.logging_config import get_logger
-from scripts.employee_names import reload_employee_names
+from app.utils.context_store import context_store
 
 # Reuse the same pipeline as the API by calling handle_query directly
 from app.main import handle_query, QueryRequest
@@ -23,8 +25,82 @@ from telegram.ext import (
     filters,
 )
 
-from app.utils.query_rewrite import rewrite_query_with_context
 from app.utils.response_formatter import render_pipeline_reply
+
+
+async def process_text_query(text: str, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """The core logic for processing a text query, shared by text and voice handlers."""
+    logger = get_logger(__name__)
+    chat_id = update.effective_chat.id
+
+    session_id = str(update.effective_user.id if update.effective_user else chat_id)
+    pending_state, expired = context_store.load(session_id)
+    if expired:
+        await update.message.reply_text("Предыдущее уточнение просрочено, контекст очищен.")
+    combined_query = text
+    if pending_state and pending_state.get("next_query_hint"):
+        base = pending_state["next_query_hint"].strip()
+        if text:
+            combined_query = f"{base}\n\nДополнительная информация пользователя: {text}"
+        else:
+            combined_query = base
+
+    # show typing indicator while processing
+    context.chat_data["last_query"] = text
+    await context.bot.send_chat_action(chat_id=chat_id, action=ChatAction.TYPING)
+
+    try:
+        logger.info(
+            "[TG→Pipeline] query=%s | rewritten=%s | context=%s",
+            text,
+            combined_query,
+            "[]",
+        )
+        request_payload = QueryRequest(
+            query=combined_query,
+            original_query=text,
+            session_id=session_id,
+            memory=context.chat_data.get("memory"),
+            pending_state=pending_state,
+        )
+        result = await _run_pipeline(request_payload)
+        memory_state = result.get("memory") or {}
+        context.chat_data["memory"] = memory_state
+        logger.info("-----------")
+        try:
+            summary = {
+                "sql": result.get("sql"),
+                "rows": len(result.get("rows", [])),
+                "iterations": result.get("iterations_used"),
+            }
+            logger.info(
+                "[TG←Pipeline] result=%s",
+                json.dumps(summary, ensure_ascii=False, default=str),
+            )
+        except Exception:
+            logger.exception("[TG] Failed to log pipeline summary")
+        reply = render_pipeline_reply(result)
+
+        # Ensure we don't exceed Telegram message limit
+        if len(reply) > 4000:
+            reply = reply[:3996] + " …"
+
+        await update.message.reply_text(reply, disable_web_page_preview=True)
+        logger.info("[TG→User] %s", reply)
+        logger.info("-----------")
+        pending_result = result.get("pending_state")
+        if pending_result and pending_result.get("next_query_hint"):
+            context_store.save(session_id, pending_result)
+        else:
+            context_store.clear(session_id)
+        context.chat_data["last_sql"] = result.get("sql")
+        context.chat_data["last_normalized_question"] = result.get("normalized_question")
+
+
+    except Exception as e:
+        logger.exception("Telegram handler error")
+        await update.message.reply_text(f"Произошла ошибка: {e}")
+
 
 def _serialize_history(history: list[Dict[str, Any]] | None) -> list[Dict[str, Any]]:
     if not history:
@@ -38,11 +114,11 @@ def _serialize_history(history: list[Dict[str, Any]] | None) -> list[Dict[str, A
     return cleaned
 
 
-async def _run_pipeline(text: str, chat_context: list[Dict[str, Any]] | None = None) -> Dict[str, Any]:
+async def _run_pipeline(request: QueryRequest) -> Dict[str, Any]:
     """Execute the same flow as the REST endpoint without blocking the event loop."""
     loop = asyncio.get_event_loop()
     # Offload sync work to default executor to avoid blocking
-    return await loop.run_in_executor(None, lambda: handle_query(QueryRequest(query=text, chat_context=chat_context)))
+    return await loop.run_in_executor(None, lambda: handle_query(request))
 
 
 def _maybe_rewrite_query(text: str, chat_data: Dict[str, Any], allow_context: bool) -> str:
@@ -62,15 +138,17 @@ def _maybe_rewrite_query(text: str, chat_data: Dict[str, Any], allow_context: bo
         pending["base_query"] = combined
         base_text = combined
 
-    last_scope = chat_data.get("last_scope")
-    last_intent = chat_data.get("last_intent")
+    memory = chat_data.get("memory") or {}
+    last_scope = chat_data.get("last_scope") or memory.get("last_scope")
+    last_intent = chat_data.get("last_intent") or memory.get("last_intent")
     history = chat_data.get("history") or []
+    last_query = chat_data.get("last_query") or memory.get("last_query")
 
     rewritten = rewrite_query_with_context(
         base_text,
         history,
         last_scope=last_scope,
-        last_query=chat_data.get("last_query"),
+        last_query=last_query,
     )
     if rewritten != base_text:
         return rewritten
@@ -127,200 +205,11 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     if not update.message or not update.message.text:
         return
 
-    chat_id = update.effective_chat.id
     text = update.message.text.strip()
     logger = get_logger(__name__)
     logger.info("[TG] %s (%s): %s", update.effective_user.id if update.effective_user else "-", update.effective_user.username if update.effective_user else "-", text)
 
-    # Direct command fast-paths (reliable regardless of intent)
-    if os.getenv("ALLOW_WRITES", "0").lower() in ("1", "true", "yes"):
-        low = text.lower()
-        try:
-            # 1) Delete appointments by last result ("удали эти записи")
-            if low.startswith("удали") and "запис" in low and ("эти" in low or "их" in low):
-                last_ids = context.chat_data.get("last_appointment_ids") or []
-                if last_ids:
-                    from app.services.appointments import delete_appointments
-                    count = delete_appointments(appointment_ids=last_ids)
-                    msg = f"Удалено записей: {count}."
-                    await update.message.reply_text(msg)
-                    logger.info("[TG→User] %s", msg)
-                    return
-                # No cached ids
-                await update.message.reply_text("Нет идентификаторов записей. Сначала запросите список, затем скажите: 'удали эти записи'.")
-                return
-
-            # 2) Delete employee (only if not 'удали записи ...')
-            if low.startswith("удали") or " удалить " in f" {low} ":
-                from app.services.employees import delete_employee
-                ok, msg = delete_employee(None, text)
-                reload_employee_names()
-                await update.message.reply_text(msg)
-                logger.info("[TG→User] %s", msg)
-                return
-            if low.startswith("добав") or low.startswith("создай"):
-                from app.services.employees import add_employee, extract_phone
-                ok, msg = add_employee(None, extract_phone(text), text)
-                reload_employee_names()
-                await update.message.reply_text(msg)
-                logger.info("[TG→User] %s", msg)
-                return
-        except Exception as e:
-            logging.exception("Direct employee command error")
-            await update.message.reply_text(f"Ошибка: {e}")
-            return
-
-    # Recency gate: ignore context if older than 1 hour
-    now_ts = time.time()
-    last_ts = context.chat_data.get("last_ts")
-    allow_context = bool(last_ts) and (now_ts - float(last_ts) <= 3600)
-
-    # Heuristic rewrite for short follow-ups (e.g., 'дай номера')
-    text_for_pipeline = _maybe_rewrite_query(text, context.chat_data, allow_context)
-    # Build recent chat context (store simple role/content turns)
-    history: list[Dict[str, Any]] = context.chat_data.get("history") or []
-    chat_ctx = history[-8:] if (history and allow_context) else None
-    # Store last query in chat_data and show typing indicator while processing
-    context.chat_data["last_query"] = text
-    await context.bot.send_chat_action(chat_id=chat_id, action=ChatAction.TYPING)
-
-    try:
-        logger.info(
-            "[TG→Pipeline] query=%s | rewritten=%s | context=%s",
-            text,
-            text_for_pipeline,
-            json.dumps(_serialize_history(chat_ctx or []), ensure_ascii=False, default=str),
-        )
-        result = await _run_pipeline(text_for_pipeline, chat_ctx)
-        try:
-            summary = {
-                "intent": result.get("intent"),
-                "entities": result.get("entities"),
-                "tables": result.get("tables"),
-                "sql": result.get("sql"),
-                "followups": result.get("followup_questions"),
-            }
-            logger.info(
-                "[TG←Pipeline] result=%s",
-                json.dumps(summary, ensure_ascii=False, default=str),
-            )
-        except Exception:
-            logger.exception("[TG] Failed to log pipeline summary")
-        # Optional: booking flow guarded by env flag
-        if (result.get("intent") == "create_appointment"):
-            if os.getenv("ALLOW_WRITES", "0").lower() in ("1", "true", "yes"):
-                from app.services.booking import book_from_entities, list_missing_booking_fields
-                # Use original (non-lowercased) text to preserve name casing
-                original = result.get("original_query") or text
-                missing = list_missing_booking_fields(original, result.get("entities") or {})
-                # If we only miss optional employee, proceed
-                required_missing = [m for m in missing if m != "сотрудник (по желанию)"]
-                if required_missing:
-                    bullets = "\n".join(f"• {m}" for m in required_missing)
-                    await update.message.reply_text(
-                        f"Чтобы создать запись, уточните:\n{bullets}"
-                    )
-                    context.chat_data["pending_booking"] = {
-                        "base_query": original,
-                        "missing": required_missing,
-                    }
-                    return
-                ok, msg = book_from_entities(original, result.get("intent"), result.get("entities") or {})
-                await update.message.reply_text(msg)
-                logger.info("[TG→User] %s", msg)
-                context.chat_data.pop("pending_booking", None)
-                return
-            else:
-                await update.message.reply_text(
-                    "Я понял, вы хотите записаться. Чтобы включить создание записей (INSERT), задайте переменную окружения ALLOW_WRITES=true. Сейчас операции записи отключены."
-                )
-                logger.info("[TG→User] writes_disabled_booking")
-                return
-        # Create/Delete employee flows
-        if result.get("intent") in ("create_employee", "delete_employee"):
-            if os.getenv("ALLOW_WRITES", "0").lower() not in ("1", "true", "yes"):
-                await update.message.reply_text("Операции записи отключены (ALLOW_WRITES=false).")
-                return
-            # Parse name and optional phone from original text
-            original = result.get("original_query") or text
-            from app.services.employees import extract_phone
-            full_name = None  # allow employees.add to parse from original text
-            phone = extract_phone(original)
-            if result.get("intent") == "create_employee":
-                from app.services.employees import add_employee
-                ok, msg = add_employee(full_name, phone, original)
-                # Refresh employee cache for name matching
-                reload_employee_names()
-                await update.message.reply_text(msg)
-                logger.info("[TG→User] %s", msg)
-                return
-            else:
-                from app.services.employees import delete_employee
-                ok, msg = delete_employee(full_name, original)
-                reload_employee_names()
-                await update.message.reply_text(msg)
-                logger.info("[TG→User] %s", msg)
-                return
-        reply = render_pipeline_reply(result)
-
-        # Ensure we don't exceed Telegram message limit
-        if len(reply) > 4000:
-            reply = reply[:3996] + " …"
-
-        await update.message.reply_text(reply, disable_web_page_preview=True)
-        logger.info("[TG→User] %s", reply)
-        # Update conversational scope for follow-ups
-        intent = result.get("intent")
-        if intent in (
-            "list_employees",
-            "create_employee",
-            "delete_employee",
-            "services_by_employee",
-            "top_employees_by_revenue",
-            "employee_productivity",
-        ):
-            context.chat_data["last_scope"] = "employees"
-        elif intent in (
-            "list_clients",
-            "client_count",
-            "client_total_spending",
-            "client_last_visit",
-            "frequent_clients",
-        ):
-            context.chat_data["last_scope"] = "clients"
-        elif intent in ("list_appointments", "upcoming_appointments"):
-            context.chat_data["last_scope"] = "appointments"
-
-        # Cache last appointment IDs for follow-up deletion
-        last_ids = []
-        try:
-            qr = result.get("query_result") or []
-            for row in qr:
-                if isinstance(row, dict):
-                    if "id" in row and isinstance(row["id"], int):
-                        last_ids.append(row["id"])
-                    elif "appointment_id" in row and isinstance(row["appointment_id"], int):
-                        last_ids.append(row["appointment_id"])
-        except Exception:
-            pass
-        if last_ids:
-            context.chat_data["last_appointment_ids"] = last_ids[-50:]
-        # Save history turn
-        history.append({"role": "user", "content": text, "ts": now_ts})
-        history.append({"role": "assistant", "content": reply, "ts": now_ts})
-        context.chat_data["history"] = history[-20:]
-        context.chat_data["last_intent"] = intent
-        context.chat_data["last_ts"] = now_ts
-
-        # Optional: if SQL was generated and user might want it, hint with a footer
-        if (result.get("sql") or (result.get("generated_response") or {}).get("sql_query")) and not (result.get("followup_questions")):
-            await context.bot.send_message(
-                chat_id=chat_id,
-                text="Если нужен SQL — напишите: sql",
-            )
-    except Exception as e:
-        logging.exception("Telegram handler error")
-        await update.message.reply_text(f"Произошла ошибка: {e}")
+    await process_text_query(text, update, context)
 
 
 async def handle_sql_keyword(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -333,17 +222,101 @@ async def handle_sql_keyword(update: Update, context: ContextTypes.DEFAULT_TYPE)
     # In the future we could cache per chat, but this keeps it simple.
     try:
         last_text = context.chat_data.get("last_query") or update.message.text
-        result = await _run_pipeline(last_text)
-        sql = result.get("sql") or (result.get("generated_response") or {}).get("sql_query")
+        request_payload = QueryRequest(
+            query=last_text,
+            original_query=last_text,
+            session_id=str(update.effective_user.id if update.effective_user else chat_id),
+            memory=context.chat_data.get("memory"),
+        )
+        result = await _run_pipeline(request_payload)
+        memory_state = result.get("memory") or {}
+        if memory_state:
+            context.chat_data["memory"] = memory_state
+        sql = result.get("sql")
         if not sql:
             await update.message.reply_text("SQL не был сгенерирован для этого запроса.")
             return
-        if len(sql) > 3800:
-            sql = sql[:3796] + " …"
-        await update.message.reply_text(f"<pre>{sql}</pre>", parse_mode=ParseMode.HTML)
+        display_sql = sql
+        if len(display_sql) > 3800:
+            display_sql = display_sql[:3796] + " …"
+        escaped_sql = html.escape(display_sql)
+        await update.message.reply_text(f"<pre>{escaped_sql}</pre>", parse_mode=ParseMode.HTML)
     except Exception as e:
-        logging.exception("SQL keyword error")
+        logger.exception("SQL keyword error")
         await update.message.reply_text(f"Ошибка при получении SQL: {e}")
+
+
+async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not update.message or not update.message.voice:
+        return
+
+    logger = get_logger(__name__)
+    logger.info("[TG] Received voice message from %s", update.effective_user.id if update.effective_user else "-")
+
+    n8n_webhook_url = os.getenv("N8N_VOICE_WEBHOOK_URL")
+    if not n8n_webhook_url:
+        logger.warning("N8N_VOICE_WEBHOOK_URL is not set, skipping voice message forwarding.")
+        # Optionally, inform the user that voice messages are not configured
+        # await update.message.reply_text("Обработка голосовых сообщений не настроена.")
+        return
+
+    try:
+        await context.bot.send_chat_action(chat_id=update.effective_chat.id, action=ChatAction.TYPING)
+        
+        voice = update.message.voice
+        voice_file = await voice.get_file()
+        voice_data = await voice_file.download_as_bytearray()
+
+        # Wrap bytearray in BytesIO to make it a file-like object for httpx
+        voice_stream = io.BytesIO(voice_data)
+
+        # Prepare metadata to send alongside the file
+        payload = {
+            "file_id": voice.file_id,
+            "file_unique_id": voice.file_unique_id,
+            "duration": voice.duration,
+            "mime_type": voice.mime_type or "audio/ogg",
+            "chat_id": update.effective_chat.id,
+            "user_id": update.effective_user.id if update.effective_user else "unknown",
+            "message_id": update.message.message_id,
+        }
+
+        # The file name can be inferred from the path, but we can also set a default
+        file_name = f"voice_{update.message.message_id}.oga"
+
+        files = {"file": (file_name, voice_stream, "audio/ogg")}
+        
+        async with httpx.AsyncClient() as client:
+            # Set a timeout for the request, e.g., 60 seconds
+            response = await client.post(n8n_webhook_url, data=payload, timeout=60.0)
+            response.raise_for_status()  # Raise an exception for bad status codes
+
+        logger.info("Voice message forwarded to n8n successfully. Status code: %d", response.status_code)
+        
+        # Process n8n response to get transcription
+        try:
+            response_data = response.json()
+            transcribed_text = response_data.get("transcription")
+
+            if transcribed_text and transcribed_text.strip():
+                logger.info("[TG] Transcription received from n8n: '%s'", transcribed_text)
+                await update.message.reply_text(f"Распознано: «{transcribed_text}»")
+                # Now process the transcribed text as a regular query
+                await process_text_query(transcribed_text, update, context)
+            else:
+                logger.warning("N8n response did not contain a valid 'transcription' field. Response: %s", response_data)
+                await update.message.reply_text("Не удалось распознать речь. Попробуйте еще раз.")
+
+        except (json.JSONDecodeError, AttributeError) as json_err:
+            logger.error("Failed to decode JSON from n8n response: %s", response.text)
+            await update.message.reply_text("Ошибка обработки ответа от сервиса распознавания.")
+
+    except httpx.HTTPStatusError as http_err:
+        logger.exception("HTTP error forwarding voice message to n8n: %s", http_err.response.text)
+        await update.message.reply_text("Ошибка при отправке голосового сообщения на обработку.")
+    except Exception as e:
+        logger.exception("Error forwarding voice message to n8n")
+        await update.message.reply_text(f"Ошибка при обработке голосового сообщения: {e}")
 
 
 def main() -> None:
@@ -369,6 +342,9 @@ def main() -> None:
 
     # Main text handler
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
+
+    # Voice message handler
+    app.add_handler(MessageHandler(filters.VOICE, handle_voice))
 
     logging.info("Telegram bot is starting (polling mode)…")
     app.run_polling(close_loop=False)
