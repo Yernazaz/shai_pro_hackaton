@@ -7,15 +7,19 @@ import psycopg2
 from fastapi import FastAPI
 from pydantic import BaseModel
 
-from app.agents import column_agent, entity_agent, input_preprocessing, intent_agent, sql_generator, table_agent
-from app.pipeline.context import PipelineContext
-from app.pipeline.orchestrator import Orchestrator
-from app.registry.agent_registry import registry
+from app.config.settings import get_settings
+from app.pipeline.controller import IterativeController
 from app.utils.logging_config import get_logger, setup_logging
+from app.utils.memory import initialise_memory, update_memory
 from app.utils.response_formatter import render_pipeline_reply
+from app.utils.query_rewrite import rewrite_query_with_context
+from app.utils.schema_loader import build_schema_brief
 
 app = FastAPI()
 logger = get_logger(__name__)
+controller = IterativeController()
+settings = get_settings()
+SCHEMA_BRIEF = build_schema_brief()
 
 
 def _serialize_context(context_list: list | None):
@@ -30,7 +34,12 @@ def _serialize_context(context_list: list | None):
 
 class QueryRequest(BaseModel):
     query: str
-    chat_context: list | None = None  # list of {role, content}
+    original_query: str | None = None
+    session_id: str | None = None
+    chat_context: list | None = None  # deprecated
+    memory: dict | None = None
+    pending_state: dict | None = None
+    org_id: int | None = None
 
 @app.on_event("startup")
 def _startup_warmup():
@@ -46,79 +55,70 @@ def _startup_warmup():
 
 @app.post("/query")
 def handle_query(request: QueryRequest):
-    # Define your pipeline steps.
-    steps = ["input_preprocessing", "intent", "entity", "table", "column", "sql"]
-    orchestrator = Orchestrator(steps)
-
-    # Run the pipeline to get the final context dictionary.
-    incoming_context = _serialize_context(request.chat_context)
+    incoming_context = []
+    incoming_memory = initialise_memory(request.memory)
+    display_query = request.original_query or request.query
     try:
-        logger.info(
-            "[API] Incoming query: %s | context=%s",
-            request.query,
-            json.dumps(incoming_context, ensure_ascii=False, default=str),
-        )
+        logger.info("[API] Incoming query: %s", display_query)
     except Exception:
         logger.exception("[API] Failed to log incoming context")
 
-    result = orchestrator.run(request.query, chat_context=request.chat_context)
-    logger.info("Cleaned query: %s", result.get("cleaned_query"))
+    rewritten_query = request.query
 
-    assistant_reply = render_pipeline_reply(result)
-    chat_context = list(request.chat_context or [])
-    chat_context.append({"role": "user", "content": request.query})
-    chat_context.append({"role": "assistant", "content": assistant_reply})
-    trimmed_context = chat_context[-12:]
-    result["assistant_message"] = assistant_reply
-    result["chat_context"] = trimmed_context
+    pending_state = request.pending_state or {}
+    pending_notes = pending_state.get("assumptions")
+    contextual_notes = ""
+    if pending_notes:
+        contextual_notes = "\n".join(str(note) for note in pending_notes if note)
+
+    runtime_context = {
+        "org_id": request.org_id,
+        "schema_brief": SCHEMA_BRIEF,
+        "contextual_notes": contextual_notes,
+        "allowed_tables": settings.allowed_tables,
+        "dialect": settings.db_dialect,
+        "pending_state": pending_state,
+    }
+
+    envelope = controller.run(rewritten_query, runtime_context)
+
+    assistant_reply = render_pipeline_reply(envelope)
+
+    updated_memory = update_memory(incoming_memory, envelope)
+    updated_memory["last_query"] = request.query
+    updated_memory["last_cleaned_query"] = rewritten_query
+
+    result_payload = {
+        "original_query": display_query,
+        "normalized_question": envelope.normalized_question,
+        "rephrased_query": rewritten_query,
+        "sql": envelope.sql,
+        "rows": envelope.rows,
+        "analysis_text": envelope.analysis_text,
+        "suggested_followup": envelope.suggested_followup,
+        "iterations_used": envelope.iterations_used,
+        "confidence": envelope.confidence,
+        "telemetry": envelope.telemetry,
+        "assistant_message": assistant_reply,
+        "memory": updated_memory,
+        "pending_state": envelope.pending_state,
+    }
 
     try:
-        summary = {
-            "intent": result.get("intent"),
-            "entities": result.get("entities"),
-            "tables": result.get("tables"),
-            "columns": result.get("columns"),
-            "sql": result.get("sql"),
-            "followups": result.get("followup_questions"),
-            "assistant_message": assistant_reply,
-        }
-        logger.info("[API] Pipeline result: %s", json.dumps(summary, ensure_ascii=False, default=str))
-        logger.info(
-            "[API] Updated context: %s",
-            json.dumps(_serialize_context(trimmed_context), ensure_ascii=False, default=str),
-        )
+        preview_rows = envelope.rows[:3] if isinstance(envelope.rows, list) else []
+        formatted_preview = [
+            ", ".join(f"{k}: {v}" for k, v in row.items()) if isinstance(row, dict) else str(row)
+            for row in preview_rows
+        ]
+        logger.info("-----------")
+        logger.info("[API] SQL: %s", envelope.sql or "<empty>")
+        logger.info("[API] Rows(%d): %s", len(envelope.rows), formatted_preview)
+        logger.info("[API] Analysis: %s", envelope.analysis_text)
+        logger.info("-----------")
     except Exception:
-        logger.exception("[API] Failed to log pipeline summary")
+        logger.exception("[API] Failed to log controller envelope")
 
-    # Check for missing pieces and generate follow-up questions.
-    missing = []
-    if not result.get("intent"):
-        missing.append("intent")
-    if not result.get("entities") or len(result.get("entities", {})) == 0:
-        missing.append("entities")
-    if not result.get("tables") or len(result.get("tables", [])) == 0:
-        missing.append("tables")
-    if not result.get("columns") or len(result.get("columns", {})) == 0:
-        missing.append("columns")
-    if not result.get("sql"):
-        missing.append("sql")
-
-    followups = []
-    if "intent" in missing:
-        followups.append("Что именно вы хотите узнать? Например: продуктивность сотрудников или платежи клиентов.")
-    if "entities" in missing:
-        followups.append("Можете уточнить временной период или имя сотрудника?")
-    if "tables" in missing:
-        followups.append("Пожалуйста, переформулируйте ваш запрос, чтобы я понял, какие таблицы использовать.")
-    if "columns" in missing:
-        followups.append("Какие данные вам важны? Например: дата, услуги или оплата.")
-    if "sql" in missing:
-        followups.append("Не удалось сгенерировать корректный SQL запрос. Можете ли вы переформулировать запрос?")
-
-    # Attach fallback questions to the result.
-    result["followup_questions"] = followups
-
-    return result
+    return result_payload
 
 @app.get("/healthz")
 def healthz():

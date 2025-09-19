@@ -1,10 +1,11 @@
-"""Helpers for turning pipeline results into user-facing replies."""
+"""Helpers for turning controller envelopes into user-facing replies."""
 
 from __future__ import annotations
 
 import re
 from typing import Any, Dict, Iterable
 
+from app.contracts.envelope import ControllerEnvelope
 
 _RUBLE_RE = re.compile(r"\bруб(?:\.|лей|ля|л[ья]ми|)\b", re.IGNORECASE)
 
@@ -20,29 +21,19 @@ def _format_followups(followups: Iterable[str]) -> str:
     return "\n".join(hints)
 
 
-def render_pipeline_reply(result: Dict[str, Any]) -> str:
-    """Produce a concise assistant reply for a pipeline result."""
+def render_pipeline_reply(result: ControllerEnvelope | Dict[str, Any]) -> str:
+    if isinstance(result, dict):
+        envelope = ControllerEnvelope(**result)
+    else:
+        envelope = result
 
-    generated = result.get("generated_response") or {}
-    human = generated.get("human_readable_text")
-    if isinstance(human, str) and human.strip():
-        return _normalize_currency(human.strip())
-
-    followups = result.get("followup_questions") or []
+    answer = _normalize_currency(envelope.analysis_text.strip()) if envelope.analysis_text else ""
+    followups = [hint for hint in envelope.suggested_followup if hint]
     if followups:
         hints = _format_followups(followups)
-        if hints:
-            return f"Нужно уточнение:\n{hints}"
-
-    intent = result.get("intent") or ""
-    entities = result.get("entities") or {}
-    if intent or entities:
-        parts = []
-        if intent:
-            parts.append(f"Намерение: {intent}")
-        if entities:
-            parts.append(f"Параметры: {entities}")
-        if parts:
-            return "\n".join(parts)
-
-    return "Не удалось понять запрос. Попробуйте переформулировать."
+        if answer:
+            return f"{answer}\n\nРекомендации:\n{hints}"
+        return f"Нужно уточнение:\n{hints}"
+    if answer:
+        return answer
+    return "Не удалось сформировать ответ. Попробуйте переформулировать запрос."

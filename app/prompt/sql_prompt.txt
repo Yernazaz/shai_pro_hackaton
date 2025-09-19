@@ -86,8 +86,8 @@ Make the summary actionable (e.g., "Найдено 5 посещений в ма�
 ---
 
 ❗️ PostgreSQL Tips
-- Use `DATE_TRUNC`, `EXTRACT`, `STRING_AGG`, `FILTER` clauses as needed.
-- Avoid MySQL-only syntax (no backticks, no NOW() without timezone awareness).
+- Use PostgreSQL aggregation helpers like `STRING_AGG` and `FILTER` clauses as needed.
+- Avoid MySQL-only syntax (no backticks).
 - When calculating totals per client or employee, join through crm_people for names.
 
 Generate only the function call JSON. No free-form explanations outside the structured schema.

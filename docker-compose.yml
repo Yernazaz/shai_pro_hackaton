@@ -22,9 +22,8 @@ services:
     container_name: nqlcrm_bot
     environment:
       TELEGRAM_BOT_TOKEN: ${TELEGRAM_BOT_TOKEN}
-      OPENAI_API_KEY: ${OPENAI_API_KEY}
-      OPENAI_MODEL: ${OPENAI_MODEL:-gpt-4o-mini}
-      LLM_BASE_URL: ${LLM_BASE_URL}
+      GEMINI_API_KEY: ${GEMINI_API_KEY}
+      GEMINI_MODEL: ${GEMINI_MODEL}
       ALLOW_WRITES: ${ALLOW_WRITES}
       DB_NAME: ${DB_NAME:-nqlcrm}
       DB_USER: ${DB_USER:-postgres}
@@ -43,9 +42,8 @@ services:
     build: .
     container_name: nqlcrm_api
     environment:
-      OPENAI_API_KEY: ${OPENAI_API_KEY}
-      OPENAI_MODEL: ${OPENAI_MODEL:-gpt-4o-mini}
-      LLM_BASE_URL: ${LLM_BASE_URL}
+      GEMINI_API_KEY: ${GEMINI_API_KEY}
+      GEMINI_MODEL: ${GEMINI_MODEL:-gemini-1.5-pro}
       DB_NAME: ${DB_NAME:-nqlcrm}
       DB_USER: ${DB_USER:-postgres}
       DB_PASSWORD: ${DB_PASSWORD:-secret}
@@ -55,9 +53,9 @@ services:
     depends_on:
       db:
         condition: service_healthy
-    command: ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000"]
+    command: ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "9000"]
     ports:
-      - "8000:8000"
+      - "9000:9000"
     volumes:
       - ./:/app
 
